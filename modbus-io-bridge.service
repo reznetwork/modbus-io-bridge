@@ -1,0 +1,31 @@
+# /etc/systemd/system/modbus-io-bridge.service
+[Unit]
+Description=Modbus IO Bridge (inputs -> coils)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=modbus
+Group=modbus
+WorkingDirectory=/opt/modbus-io-bridge
+EnvironmentFile=-/etc/default/modbus-io-bridge
+# Defaults (override in /etc/default/modbus-io-bridge):
+#   CONFIG=/opt/modbus-io-bridge/config.yaml
+#   PYTHON_BIN=/usr/bin/python3
+#   EXTRA_ARGS=
+ExecStart=/bin/sh -lc '${PYTHON_BIN:-/usr/bin/python3} /opt/modbus-io-bridge/modbus_io_bridge.py --config ${CONFIG:-/opt/modbus-io-bridge/config_tractor.yaml} ${EXTRA_ARGS}'
+Restart=always
+RestartSec=3
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
