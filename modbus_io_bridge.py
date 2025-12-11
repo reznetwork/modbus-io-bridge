@@ -4,7 +4,7 @@ modbus_io_bridge.py
 -------------------
 Mirror digital inputs from one (or many) Modbus/TCP devices to coils on another (or many) devices.
 - Supports multiple input and output devices.
-- Logic is strictly 1 input -> 1 output per mapping.
+- Logic supports combining multiple inputs (AND/OR/NOT/XOR) into one output.
 - Async, resilient reconnects, optional debounce, optional invert, and on-error behavior.
 
 Requires: pymodbus>=3.6.4 (asyncio client)
@@ -22,8 +22,9 @@ import argparse
 import asyncio
 import logging
 import signal
-from dataclasses import dataclass
-from typing import Dict, Optional
+import ast
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 import yaml
 from pymodbus.client import AsyncModbusTcpClient
@@ -46,6 +47,7 @@ class InputEndpoint:
     device: str            # device name (must exist in devices[])
     address: int           # bit address to read
     source_type: str = "discrete_input"  # "discrete_input" or "coil"
+    name: Optional[str] = None            # optional alias used in logic expressions
 
 @dataclass(frozen=True)
 class OutputEndpoint:
@@ -55,7 +57,9 @@ class OutputEndpoint:
 @dataclass(frozen=True)
 class Mapping:
     name: str
-    input: InputEndpoint
+    input: Optional[InputEndpoint] = None
+    inputs: List[InputEndpoint] = field(default_factory=list)
+    logic: Optional[str] = None           # boolean expression using input names
     output: OutputEndpoint
     invert: bool = False
     debounce_ms: int = 0           # require stable state for this many ms before writing
@@ -148,6 +152,7 @@ class MappingWorker:
         self._last_written: Optional[bool] = None
         self._candidate_state: Optional[bool] = None
         self._candidate_since: Optional[float] = None
+        self._inputs = self.mp.inputs if self.mp.inputs else ([self.mp.input] if self.mp.input else [])
 
     def start(self):
         self._task = asyncio.create_task(self._run(), name=f"map:{self.name}")
@@ -165,8 +170,8 @@ class MappingWorker:
         debounce_s = self.mp.debounce_ms / 1000.0
         while True:
             try:
-                val = await self.dm.read_bit(self.mp.input.device, self.mp.input.address, self.mp.input.source_type)
-                if val is None:
+                values = await self._read_inputs()
+                if values is None:
                     # Error behavior
                     if self.mp.on_error == "force_off":
                         await self._maybe_write(False)
@@ -174,7 +179,9 @@ class MappingWorker:
                         await self._maybe_write(True)
                     # hold => do nothing
                 else:
-                    desired = not val if self.mp.invert else val
+                    desired = self._evaluate_logic(values)
+                    if self.mp.invert:
+                        desired = not desired
                     if debounce_s <= 0:
                         await self._maybe_write(desired)
                     else:
@@ -202,9 +209,81 @@ class MappingWorker:
                 logging.warning(f"[{self.name}] write failed {self._format_io()} desired={int(desired)}")
 
     def _format_io(self) -> str:
-        i = self.mp.input
         o = self.mp.output
-        return f"IN {i.device}/{i.source_type}[{i.address}] -> OUT {o.device}/coil[{o.address}]"
+        if self._inputs:
+            ins = ", ".join(
+                f"{inp.name or inp.device}:{inp.source_type}[{inp.address}]" for inp in self._inputs
+            )
+        else:
+            ins = "<no inputs>"
+        return f"IN {ins} -> OUT {o.device}/coil[{o.address}]"
+
+    async def _read_inputs(self) -> Optional[Dict[str, bool]]:
+        values: Dict[str, bool] = {}
+        for idx, inp in enumerate(self._inputs):
+            val = await self.dm.read_bit(inp.device, inp.address, inp.source_type)
+            if val is None:
+                return None
+            key = inp.name or f"in{idx+1}"
+            values[key] = bool(val)
+        return values
+
+    def _evaluate_logic(self, values: Dict[str, bool]) -> bool:
+        if self.mp.logic:
+            return _evaluate_expression(self.mp.logic, values)
+        # Fallback to single input
+        if len(values) != 1:
+            raise ValueError(f"Mapping '{self.name}' requires logic for multiple inputs")
+        return next(iter(values.values()))
+
+
+def _evaluate_expression(expr: str, values: Dict[str, bool]) -> bool:
+    """
+    Evaluate a simple boolean expression using provided values.
+    Supports AND/OR/NOT and XOR (using ^) operators.
+    """
+
+    def _eval(node: ast.AST) -> bool:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.BoolOp):
+            vals = [_eval(v) for v in node.values]
+            if isinstance(node.op, ast.And):
+                return all(vals)
+            if isinstance(node.op, ast.Or):
+                return any(vals)
+            raise ValueError("Only AND/OR boolean operators are supported")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitXor):
+            return _eval(node.left) ^ _eval(node.right)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return not _eval(node.operand)
+        if isinstance(node, ast.Name):
+            if node.id not in values:
+                raise ValueError(f"Unknown variable '{node.id}' in logic expression")
+            return bool(values[node.id])
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            return bool(node.value)
+        raise ValueError("Unsupported expression; use AND, OR, NOT, XOR (^), and parentheses")
+
+    try:
+        parsed = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid logic expression '{expr}': {exc}" ) from exc
+    return bool(_eval(parsed))
+
+
+def _derive_mapping_name(raw_mapping: dict) -> str:
+    if raw_mapping.get("name"):
+        return str(raw_mapping["name"])
+    if "input" in raw_mapping:
+        inp = raw_mapping["input"]
+        out = raw_mapping["output"]
+        return f"map_{inp['device']}_{inp['address']}__{out['device']}_{out['address']}"
+    if raw_mapping.get("inputs"):
+        first = raw_mapping["inputs"][0]
+        out = raw_mapping["output"]
+        return f"map_{first['device']}_{first['address']}__{out['device']}_{out['address']}"
+    raise ValueError("Mapping entry must include 'name', or at least inputs and output")
 
 # ---------------------------
 # Config Loader
@@ -233,16 +312,42 @@ def load_config(path: str):
 
     mappings = {}
     for m in raw.get("mappings", []):
-        name = m.get("name") or f"map_{m['input']['device']}_{m['input']['address']}__{m['output']['device']}_{m['output']['address']}"
-        inp = m["input"]
+        name = _derive_mapping_name(m)
+        inputs: List[InputEndpoint] = []
+        logic_expr = m.get("logic")
+        if "inputs" in m:
+            if not m["inputs"]:
+                raise ValueError(f"Mapping '{name}' must specify at least one input")
+            for idx, inp_cfg in enumerate(m["inputs"]):
+                alias = inp_cfg.get("name") or f"in{idx+1}"
+                inputs.append(
+                    InputEndpoint(
+                        device=inp_cfg["device"],
+                        address=int(inp_cfg["address"]),
+                        source_type=inp_cfg.get("source_type", "discrete_input"),
+                        name=alias,
+                    )
+                )
+            if logic_expr is None:
+                raise ValueError(f"Mapping '{name}' using multiple inputs requires 'logic'")
+        elif "input" in m:
+            inp = m["input"]
+            inputs.append(
+                InputEndpoint(
+                    device=inp["device"],
+                    address=int(inp["address"]),
+                    source_type=inp.get("source_type", "discrete_input"),
+                    name=inp.get("name"),
+                )
+            )
+        else:
+            raise ValueError(f"Mapping '{name}' is missing 'input' or 'inputs'")
         out = m["output"]
         mp = Mapping(
             name=name,
-            input=InputEndpoint(
-                device=inp["device"],
-                address=int(inp["address"]),
-                source_type=inp.get("source_type", "discrete_input"),
-            ),
+            input=inputs[0] if len(inputs) == 1 else None,
+            inputs=inputs,
+            logic=logic_expr,
             output=OutputEndpoint(
                 device=out["device"],
                 address=int(out["address"]),
@@ -252,8 +357,9 @@ def load_config(path: str):
             on_error=str(m.get("on_error", "hold")).lower(),
         )
         # Validate device names
-        if mp.input.device not in devices:
-            raise ValueError(f"Mapping '{name}' references unknown input device '{mp.input.device}'")
+        for inp in mp.inputs:
+            if inp.device not in devices:
+                raise ValueError(f"Mapping '{name}' references unknown input device '{inp.device}'")
         if mp.output.device not in devices:
             raise ValueError(f"Mapping '{name}' references unknown output device '{mp.output.device}'")
         mappings[name] = mp

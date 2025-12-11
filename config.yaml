@@ -37,7 +37,7 @@ settings:
   log_level: INFO         # DEBUG/INFO/WARNING/ERROR
   connect_retry_s: 3.0    # backoff for reconnect
 
-# Mappings: strictly 1 input -> 1 output per entry
+# Mappings: 1 output per entry, each with one or many inputs
 mappings:
   - name: handbrake
     input:
@@ -62,3 +62,38 @@ mappings:
     invert: false               # logical NOT of the input
     debounce_ms: 300
     on_error: force_off
+
+  # Example of combining multiple inputs with logic
+  - name: headlights_logic
+    inputs:
+      - name: switch_left
+        device: mb_io_2
+        address: 5
+        source_type: discrete_input
+      - name: switch_right
+        device: mb_io_2
+        address: 8
+        source_type: discrete_input
+    # Turn on output when exactly one of the switches is active
+    logic: "switch_left ^ switch_right"
+    output:
+      device: mb_io_2
+      address: 20
+    debounce_ms: 100
+    on_error: hold
+
+  # Example using implicit names (in1, in2, ...) when no input names are given
+  - name: fan_enable_logic
+    inputs:
+      - device: mb_io_2
+        address: 2
+        source_type: discrete_input
+      - device: mb_io_3
+        address: 7
+        source_type: discrete_input
+    logic: "in1 and not in2"  # in1 -> enable signal, in2 -> interlock
+    output:
+      device: mb_io_1
+      address: 12
+    debounce_ms: 200
+    on_error: hold
