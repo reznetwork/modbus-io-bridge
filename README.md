@@ -1,7 +1,9 @@
 # modbus-io-bridge
 
-Bridge Modbus/TCP inputs to outputs with optional debounce, inversion, and
-basic boolean logic between multiple inputs.
+Bridge Modbus/TCP **and RTU** inputs to outputs with optional debounce,
+inversion, and basic boolean logic between multiple inputs. The bridge can also
+expose computed logic results as **Modbus/TCP discrete inputs** so that external
+controllers can query the state of each mapping.
 
 ## Logical expressions
 
@@ -87,3 +89,39 @@ mappings:
       device: mb_io_2
       address: 11
 ```
+
+## Modbus/RTU inputs and outputs
+
+Define an RTU device by setting `protocol: rtu` and providing a serial
+configuration. All other mapping options work the same way as TCP devices.
+
+```yaml
+devices:
+  - name: mb_io_rtu
+    protocol: rtu
+    serial_port: /dev/ttyUSB0
+    baudrate: 19200
+    parity: N
+    bytesize: 8
+    stopbits: 1
+    unit_id: 1
+    timeout: 3.0
+```
+
+## Exposing mapping outputs as a Modbus server
+
+When server support is enabled the bridge publishes each mapping's logic result
+as a discrete input starting at `server_base_di_address`, allowing external
+clients to read the logical state without wiring another output device.
+
+```yaml
+settings:
+  server_enabled: true
+  server_host: 0.0.0.0
+  server_port: 1502
+  server_base_di_address: 0
+```
+
+Addresses are assigned in mapping order; for example, the first mapping appears
+at `server_base_di_address`, the second at `server_base_di_address + 1`, and so
+on.

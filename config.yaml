@@ -31,11 +31,26 @@ devices:
     unit_id: 1
     timeout: 3.0
 
+  # Example Modbus/RTU device over serial
+  - name: mb_io_rtu
+    protocol: rtu
+    serial_port: /dev/ttyUSB0
+    baudrate: 19200
+    parity: N
+    bytesize: 8
+    stopbits: 1
+    unit_id: 1
+    timeout: 3.0
+
 # Global settings
 settings:
   poll_interval_ms: 100   # how often to read inputs
   log_level: INFO         # DEBUG/INFO/WARNING/ERROR
   connect_retry_s: 3.0    # backoff for reconnect
+  server_enabled: true    # expose mapping outputs as discrete inputs via Modbus/TCP server
+  server_host: 0.0.0.0
+  server_port: 1502
+  server_base_di_address: 0
 
 # Mappings: 1 output per entry, each with one or many inputs
 mappings:
