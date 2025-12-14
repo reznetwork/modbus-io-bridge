@@ -27,8 +27,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import yaml
-from pymodbus.client import AsyncModbusTcpClient
+from pymodbus.client import AsyncModbusSerialClient, AsyncModbusTcpClient
 from pymodbus.exceptions import ModbusException
+from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext, ModbusSlaveContext
+from pymodbus.server import StartAsyncTcpServer
 
 # ---------------------------
 # Data Models
@@ -37,10 +39,16 @@ from pymodbus.exceptions import ModbusException
 @dataclass(frozen=True)
 class DeviceConfig:
     name: str
-    host: str
+    host: Optional[str] = None
     port: int = 502
     unit_id: int = 1
     timeout: float = 3.0
+    protocol: str = "tcp"  # "tcp" or "rtu"
+    serial_port: Optional[str] = None
+    baudrate: int = 9600
+    bytesize: int = 8
+    parity: str = "N"
+    stopbits: int = 1
 
 @dataclass(frozen=True)
 class InputEndpoint:
@@ -70,6 +78,69 @@ class Settings:
     poll_interval_ms: int = 100    # how often to poll each input
     log_level: str = "INFO"        # DEBUG/INFO/WARNING/ERROR
     connect_retry_s: float = 3.0   # reconnect backoff
+    server_enabled: bool = False
+    server_host: str = "0.0.0.0"
+    server_port: int = 1502
+    server_base_di_address: int = 0
+
+
+class BridgeState:
+    def __init__(self, mapping_names: List[str]):
+        self._indices = {name: idx for idx, name in enumerate(mapping_names)}
+        self._values: List[bool] = [False] * len(mapping_names)
+        self._server: Optional[ModbusServer] = None
+
+    def attach_server(self, server: "ModbusServer"):
+        self._server = server
+        # push initial values
+        for name, value in self._values_snapshot().items():
+            self._server.update_discrete_input(name, value)
+
+    def set_mapping_value(self, name: str, value: bool):
+        if name not in self._indices:
+            return
+        idx = self._indices[name]
+        self._values[idx] = value
+        if self._server:
+            self._server.update_discrete_input(name, value)
+
+    def _values_snapshot(self) -> Dict[str, bool]:
+        return {name: self._values[idx] for name, idx in self._indices.items()}
+
+
+class ModbusServer:
+    def __init__(self, host: str, port: int, base_di_address: int, mapping_names: List[str]):
+        self.host = host
+        self.port = port
+        self.base_di_address = base_di_address
+        self.mapping_names = mapping_names
+        self._context = ModbusServerContext(
+            slaves=ModbusSlaveContext(
+                di=ModbusSequentialDataBlock(base_di_address, [0] * max(1, len(mapping_names))),
+            ),
+            single=True,
+        )
+        self._task: Optional[asyncio.Task] = None
+
+    def update_discrete_input(self, name: str, value: bool):
+        if name not in self.mapping_names:
+            return
+        idx = self.mapping_names.index(name)
+        self._context[0x00].setValues(2, self.base_di_address + idx, [1 if value else 0])
+
+    async def start(self):
+        self._task = asyncio.create_task(
+            StartAsyncTcpServer(context=self._context, address=(self.host, self.port)),
+            name="modbus-server",
+        )
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
 # ---------------------------
 # Device Manager
@@ -94,9 +165,23 @@ class DeviceManager:
     async def _get_client(self, name: str) -> AsyncModbusTcpClient:
         if name not in self.clients:
             cfg = self.devices_cfg[name]
-            client = AsyncModbusTcpClient(
-                host=cfg.host, port=cfg.port, timeout=cfg.timeout, retries=0
-            )
+            if cfg.protocol == "rtu":
+                if not cfg.serial_port:
+                    raise ValueError(f"Device '{name}' protocol=rtu requires 'serial_port'")
+                client = AsyncModbusSerialClient(
+                    method="rtu",
+                    port=cfg.serial_port,
+                    baudrate=cfg.baudrate,
+                    stopbits=cfg.stopbits,
+                    bytesize=cfg.bytesize,
+                    parity=cfg.parity,
+                    timeout=cfg.timeout,
+                    retries=0,
+                )
+            else:
+                client = AsyncModbusTcpClient(
+                    host=cfg.host or "localhost", port=cfg.port, timeout=cfg.timeout, retries=0
+                )
             self.clients[name] = client
         client = self.clients[name]
         if not client.connected:  # ensure connection
@@ -143,11 +228,14 @@ class DeviceManager:
 # ---------------------------
 
 class MappingWorker:
-    def __init__(self, name: str, dm: DeviceManager, mp: Mapping, settings: Settings):
+    def __init__(
+        self, name: str, dm: DeviceManager, mp: Mapping, settings: Settings, state: BridgeState
+    ):
         self.name = name
         self.dm = dm
         self.mp = mp
         self.settings = settings
+        self.state = state
         self._task: Optional[asyncio.Task] = None
         self._last_written: Optional[bool] = None
         self._candidate_state: Optional[bool] = None
@@ -200,6 +288,7 @@ class MappingWorker:
                 await asyncio.sleep(self.settings.connect_retry_s)
 
     async def _maybe_write(self, desired: bool):
+        self.state.set_mapping_value(self.name, desired)
         if self._last_written is None or self._last_written != desired:
             ok = await self.dm.write_coil(self.mp.output.device, self.mp.output.address, desired)
             if ok:
@@ -296,10 +385,16 @@ def load_config(path: str):
     devices = {
         d["name"]: DeviceConfig(
             name=d["name"],
-            host=d["host"],
+            host=d.get("host"),
             port=d.get("port", 502),
             unit_id=d.get("unit_id", 1),
             timeout=float(d.get("timeout", 3.0)),
+            protocol=str(d.get("protocol", "tcp")).lower(),
+            serial_port=d.get("serial_port"),
+            baudrate=int(d.get("baudrate", 9600)),
+            bytesize=int(d.get("bytesize", 8)),
+            parity=str(d.get("parity", "N")),
+            stopbits=int(d.get("stopbits", 1)),
         )
         for d in raw.get("devices", [])
     }
@@ -308,6 +403,10 @@ def load_config(path: str):
         poll_interval_ms=int(raw.get("settings", {}).get("poll_interval_ms", 100)),
         log_level=str(raw.get("settings", {}).get("log_level", "INFO")).upper(),
         connect_retry_s=float(raw.get("settings", {}).get("connect_retry_s", 3.0)),
+        server_enabled=bool(raw.get("settings", {}).get("server_enabled", False)),
+        server_host=str(raw.get("settings", {}).get("server_host", "0.0.0.0")),
+        server_port=int(raw.get("settings", {}).get("server_port", 1502)),
+        server_base_di_address=int(raw.get("settings", {}).get("server_base_di_address", 0)),
     )
 
     mappings = {}
@@ -380,7 +479,19 @@ async def main_async(cfg_path: str):
 
     dm = DeviceManager(devices)
 
-    workers = [MappingWorker(name, dm, mp, settings) for name, mp in mappings.items()]
+    bridge_state = BridgeState(list(mappings.keys()))
+    server: Optional[ModbusServer] = None
+    if settings.server_enabled:
+        server = ModbusServer(
+            host=settings.server_host,
+            port=settings.server_port,
+            base_di_address=settings.server_base_di_address,
+            mapping_names=list(mappings.keys()),
+        )
+        bridge_state.attach_server(server)
+        await server.start()
+
+    workers = [MappingWorker(name, dm, mp, settings, bridge_state) for name, mp in mappings.items()]
     for w in workers:
         w.start()
 
@@ -403,6 +514,8 @@ async def main_async(cfg_path: str):
     logging.info("Stopping workers...")
     await asyncio.gather(*(w.stop() for w in workers), return_exceptions=True)
     await dm.stop()
+    if server:
+        await server.stop()
     logging.info("Stopped.")
 
 def parse_args():
