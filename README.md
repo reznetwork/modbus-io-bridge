@@ -63,6 +63,7 @@ mappings:
       address: 12
 ```
 
+
 ### Example: require two signals on and a third signal off
 
 Use `and` to assert the two inputs that must be on, and `not` to enforce the
