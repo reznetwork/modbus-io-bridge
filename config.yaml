@@ -37,6 +37,25 @@ settings:
   log_level: INFO         # DEBUG/INFO/WARNING/ERROR
   connect_retry_s: 3.0    # backoff for reconnect
 
+# Optional Modbus server to expose logic outputs as discrete inputs
+server:
+  enabled: true
+  protocol: tcp           # tcp | rtu
+  host: 0.0.0.0
+  port: 1502
+  unit_id: 1
+  start_address: 0
+  publish_mappings:
+    - name: handbrake     # exposed at DI 0
+    - name: neutral       # exposed at DI 1
+
+  # RTU parameters (used when protocol is rtu)
+  serial_port: /dev/ttyUSB0
+  baudrate: 9600
+  bytesize: 8
+  parity: N
+  stopbits: 1
+
 # Mappings: 1 output per entry, each with one or many inputs
 mappings:
   - name: handbrake

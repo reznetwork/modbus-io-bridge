@@ -6,6 +6,7 @@ Mirror digital inputs from one (or many) Modbus/TCP devices to coils on another 
 - Supports multiple input and output devices.
 - Logic supports combining multiple inputs (AND/OR/NOT/XOR) into one output.
 - Async, resilient reconnects, optional debounce, optional invert, and on-error behavior.
+- Optional Modbus TCP/RTU server exposes logic results as discrete inputs for other devices.
 
 Requires: pymodbus>=3.6.4 (asyncio client)
     pip install "pymodbus>=3.6.4"
@@ -28,7 +29,14 @@ from typing import Dict, List, Optional
 
 import yaml
 from pymodbus.client import AsyncModbusTcpClient
+from pymodbus.datastore import (
+    ModbusSequentialDataBlock,
+    ModbusServerContext,
+    ModbusSlaveContext,
+)
 from pymodbus.exceptions import ModbusException
+from pymodbus.server import StartAsyncSerialServer, StartAsyncTcpServer
+from pymodbus.transaction import ModbusRtuFramer
 
 # ---------------------------
 # Data Models
@@ -70,6 +78,28 @@ class Settings:
     poll_interval_ms: int = 100    # how often to poll each input
     log_level: str = "INFO"        # DEBUG/INFO/WARNING/ERROR
     connect_retry_s: float = 3.0   # reconnect backoff
+
+
+@dataclass(frozen=True)
+class PublishedMapping:
+    name: str
+    address: int
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    enabled: bool = False
+    protocol: str = "tcp"  # "tcp" or "rtu"
+    host: str = "0.0.0.0"
+    port: int = 1502
+    unit_id: int = 1
+    serial_port: str = "/dev/ttyUSB0"
+    baudrate: int = 9600
+    bytesize: int = 8
+    parity: str = "N"
+    stopbits: int = 1
+    start_address: int = 0
+    published: List[PublishedMapping] = field(default_factory=list)
 
 # ---------------------------
 # Device Manager
@@ -138,21 +168,106 @@ class DeviceManager:
             logging.debug(f"write_coil error on {device}@{address}: {e}")
             return False
 
+
+class LogicResultServer:
+    def __init__(self, cfg: ServerConfig):
+        self.cfg = cfg
+        self.mapping_addresses: Dict[str, int] = {
+            pm.name: pm.address for pm in (cfg.published or [])
+        }
+        self._di_block: Optional[ModbusSequentialDataBlock] = None
+        self._task: Optional[asyncio.Task] = None
+        self._context: Optional[ModbusServerContext] = None
+
+    async def start(self):
+        if not self.cfg.enabled:
+            return
+        if not self.mapping_addresses:
+            logging.warning("Server enabled but no published mappings configured; skipping start")
+            return
+        min_addr = min(self.mapping_addresses.values())
+        if min_addr < self.cfg.start_address:
+            raise ValueError("Published mapping addresses cannot be below start_address")
+        max_addr = max(self.mapping_addresses.values())
+        di_size = (max_addr - self.cfg.start_address) + 1
+        self._di_block = ModbusSequentialDataBlock(self.cfg.start_address, [0] * di_size)
+        empty_block = ModbusSequentialDataBlock(0, [0])
+        slave = ModbusSlaveContext(
+            di=self._di_block,
+            co=empty_block,
+            hr=empty_block,
+            ir=empty_block,
+            zero_mode=True,
+        )
+        self._context = ModbusServerContext(slaves={self.cfg.unit_id: slave}, single=False)
+
+        async def _run_server():
+            if self.cfg.protocol.lower() == "tcp":
+                await StartAsyncTcpServer(
+                    context=self._context, address=(self.cfg.host, self.cfg.port)
+                )
+            elif self.cfg.protocol.lower() == "rtu":
+                await StartAsyncSerialServer(
+                    context=self._context,
+                    framer=ModbusRtuFramer,
+                    port=self.cfg.serial_port,
+                    baudrate=self.cfg.baudrate,
+                    bytesize=self.cfg.bytesize,
+                    parity=self.cfg.parity,
+                    stopbits=self.cfg.stopbits,
+                )
+            else:
+                raise ValueError(f"Unsupported server protocol: {self.cfg.protocol}")
+
+        self._task = asyncio.create_task(_run_server(), name="logic-server")
+        logging.info("Started logic Modbus %s server", self.cfg.protocol.upper())
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    def publish(self, mapping_name: str, value: bool):
+        if not self._di_block or mapping_name not in self.mapping_addresses:
+            return
+        address = self.mapping_addresses[mapping_name]
+        try:
+            self._di_block.setValues(address, [int(bool(value))])
+        except Exception as exc:
+            logging.debug(
+                "Failed to publish logic state for %s at %s: %s",
+                mapping_name,
+                address,
+                exc,
+            )
+
 # ---------------------------
 # Mapping Worker
 # ---------------------------
 
 class MappingWorker:
-    def __init__(self, name: str, dm: DeviceManager, mp: Mapping, settings: Settings):
+    def __init__(
+        self,
+        name: str,
+        dm: DeviceManager,
+        mp: Mapping,
+        settings: Settings,
+        server: Optional[LogicResultServer] = None,
+    ):
         self.name = name
         self.dm = dm
         self.mp = mp
         self.settings = settings
         self._task: Optional[asyncio.Task] = None
         self._last_written: Optional[bool] = None
+        self._last_published: Optional[bool] = None
         self._candidate_state: Optional[bool] = None
         self._candidate_since: Optional[float] = None
         self._inputs = self.mp.inputs if self.mp.inputs else ([self.mp.input] if self.mp.input else [])
+        self.server = server
 
     def start(self):
         self._task = asyncio.create_task(self._run(), name=f"map:{self.name}")
@@ -200,6 +315,7 @@ class MappingWorker:
                 await asyncio.sleep(self.settings.connect_retry_s)
 
     async def _maybe_write(self, desired: bool):
+        self._publish(desired)
         if self._last_written is None or self._last_written != desired:
             ok = await self.dm.write_coil(self.mp.output.device, self.mp.output.address, desired)
             if ok:
@@ -207,6 +323,11 @@ class MappingWorker:
                 logging.info(f"[{self.name}] {self._format_io()} => wrote {int(desired)}")
             else:
                 logging.warning(f"[{self.name}] write failed {self._format_io()} desired={int(desired)}")
+
+    def _publish(self, desired: bool):
+        if self.server and (self._last_published is None or self._last_published != desired):
+            self.server.publish(self.name, desired)
+            self._last_published = desired
 
     def _format_io(self) -> str:
         o = self.mp.output
@@ -310,6 +431,33 @@ def load_config(path: str):
         connect_retry_s=float(raw.get("settings", {}).get("connect_retry_s", 3.0)),
     )
 
+    server_raw = raw.get("server", {}) or {}
+    start_address = int(server_raw.get("start_address", 0))
+    published: List[PublishedMapping] = []
+    for idx, pub in enumerate(server_raw.get("publish_mappings", [])):
+        if isinstance(pub, str):
+            name = pub
+            addr = start_address + idx
+        else:
+            name = pub["name"]
+            addr = int(pub.get("address", start_address + idx))
+        published.append(PublishedMapping(name=name, address=addr))
+
+    server_cfg = ServerConfig(
+        enabled=bool(server_raw.get("enabled", False)),
+        protocol=str(server_raw.get("protocol", "tcp")),
+        host=str(server_raw.get("host", "0.0.0.0")),
+        port=int(server_raw.get("port", 1502)),
+        unit_id=int(server_raw.get("unit_id", 1)),
+        serial_port=str(server_raw.get("serial_port", "/dev/ttyUSB0")),
+        baudrate=int(server_raw.get("baudrate", 9600)),
+        bytesize=int(server_raw.get("bytesize", 8)),
+        parity=str(server_raw.get("parity", "N")),
+        stopbits=int(server_raw.get("stopbits", 1)),
+        start_address=start_address,
+        published=published,
+    )
+
     mappings = {}
     for m in raw.get("mappings", []):
         name = _derive_mapping_name(m)
@@ -364,14 +512,20 @@ def load_config(path: str):
             raise ValueError(f"Mapping '{name}' references unknown output device '{mp.output.device}'")
         mappings[name] = mp
 
-    return devices, settings, mappings
+    for pub in server_cfg.published:
+        if pub.name not in mappings:
+            raise ValueError(
+                f"Server publish_mappings references unknown mapping '{pub.name}'"
+            )
+
+    return devices, settings, mappings, server_cfg
 
 # ---------------------------
 # Main
 # ---------------------------
 
 async def main_async(cfg_path: str):
-    devices, settings, mappings = load_config(cfg_path)
+    devices, settings, mappings, server_cfg = load_config(cfg_path)
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
@@ -379,8 +533,13 @@ async def main_async(cfg_path: str):
     )
 
     dm = DeviceManager(devices)
+    logic_server = LogicResultServer(server_cfg)
+    await logic_server.start()
 
-    workers = [MappingWorker(name, dm, mp, settings) for name, mp in mappings.items()]
+    workers = [
+        MappingWorker(name, dm, mp, settings, server=logic_server)
+        for name, mp in mappings.items()
+    ]
     for w in workers:
         w.start()
 
@@ -402,6 +561,7 @@ async def main_async(cfg_path: str):
 
     logging.info("Stopping workers...")
     await asyncio.gather(*(w.stop() for w in workers), return_exceptions=True)
+    await logic_server.stop()
     await dm.stop()
     logging.info("Stopped.")
 
