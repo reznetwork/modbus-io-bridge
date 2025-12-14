@@ -97,3 +97,25 @@ mappings:
       address: 12
     debounce_ms: 200
     on_error: hold
+
+  # Example requiring two inputs ON and one input OFF
+  - name: dual_ok_one_blocked
+    inputs:
+      - name: ok_a
+        device: mb_io_1
+        address: 4
+        source_type: discrete_input
+      - name: ok_b
+        device: mb_io_1
+        address: 5
+        source_type: discrete_input
+      - name: blocked
+        device: mb_io_1
+        address: 6
+        source_type: discrete_input
+    logic: "ok_a and ok_b and not blocked"
+    output:
+      device: mb_io_2
+      address: 11
+    debounce_ms: 150
+    on_error: force_off

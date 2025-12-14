@@ -62,3 +62,28 @@ mappings:
       device: mb_io_1
       address: 12
 ```
+
+
+### Example: require two signals on and a third signal off
+
+Use `and` to assert the two inputs that must be on, and `not` to enforce the
+third input is off:
+
+```yaml
+mappings:
+  - name: two_on_one_off
+    inputs:
+      - name: primary
+        device: mb_io_1
+        address: 4
+      - name: secondary
+        device: mb_io_1
+        address: 5
+      - name: inhibit
+        device: mb_io_1
+        address: 6
+    logic: "primary and secondary and not inhibit"
+    output:
+      device: mb_io_2
+      address: 11
+```
