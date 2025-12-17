@@ -65,10 +65,10 @@ class OutputEndpoint:
 @dataclass(frozen=True)
 class Mapping:
     name: str
+    output: OutputEndpoint
     input: Optional[InputEndpoint] = None
     inputs: List[InputEndpoint] = field(default_factory=list)
     logic: Optional[str] = None           # boolean expression using input names
-    output: OutputEndpoint
     invert: bool = False
     debounce_ms: int = 0           # require stable state for this many ms before writing
     on_error: str = "hold"         # "hold" (do nothing) or "force_off" or "force_on"
