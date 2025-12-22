@@ -8,8 +8,8 @@ Mirror digital inputs from one (or many) Modbus/TCP devices to coils on another 
 - Async, resilient reconnects, optional debounce, optional invert, and on-error behavior.
 - Optional Modbus TCP/RTU server exposes logic results as discrete inputs for other devices.
 
-Requires: pymodbus>=3.6.4 (asyncio client)
-    pip install "pymodbus>=3.6.4"
+Requires: pymodbus==3.6.9 (asyncio client)
+    pip install "pymodbus==3.6.9"
 
 Usage:
     python modbus_io_bridge.py --config config.yaml
@@ -181,9 +181,9 @@ class DeviceManager:
             client = await self._get_client(device)
             slave_id = self.devices_cfg[device].unit_id
             if source_type == "discrete_input":
-                rr = await client.read_discrete_inputs(address=address, count=1, slave=slave_id)
+                rr = await client.read_discrete_inputs(address=address, count=1, unit=slave_id)
             elif source_type == "coil":
-                rr = await client.read_coils(address=address, count=1, slave=slave_id)
+                rr = await client.read_coils(address=address, count=1, unit=slave_id)
             else:
                 raise ValueError(f"Unsupported source_type: {source_type}")
             if rr.isError():
@@ -200,7 +200,7 @@ class DeviceManager:
         try:
             client = await self._get_client(device)
             slave_id = self.devices_cfg[device].unit_id
-            rq = await client.write_coil(address=address, value=value, slave=slave_id)
+            rq = await client.write_coil(address=address, value=value, unit=slave_id)
             if rq.isError():
                 raise ModbusException(str(rq))
             return True
