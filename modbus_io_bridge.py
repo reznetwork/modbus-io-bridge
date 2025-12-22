@@ -21,6 +21,7 @@ License: MIT
 """
 import argparse
 import asyncio
+import inspect
 import logging
 import signal
 import ast
@@ -113,6 +114,7 @@ class DeviceManager:
     def __init__(self, devices: Dict[str, DeviceConfig]):
         self.devices_cfg = devices
         self.clients: Dict[str, AsyncModbusTcpClient] = {}
+        self._unit_kwarg_cache: Dict[str, Optional[str]] = {}
 
     async def start(self):
         # Lazy connect on first use
@@ -212,10 +214,12 @@ class DeviceManager:
 
         async def _read(client: AsyncModbusTcpClient) -> bool:
             slave_id = self.devices_cfg[device].unit_id
+            unit_kwargs = self._unit_kwargs(client.read_discrete_inputs, slave_id)
             if source_type == "discrete_input":
-                rr = await client.read_discrete_inputs(address=address, count=1, unit=slave_id)
+                rr = await client.read_discrete_inputs(address=address, count=1, **unit_kwargs)
             elif source_type == "coil":
-                rr = await client.read_coils(address=address, count=1, unit=slave_id)
+                unit_kwargs = self._unit_kwargs(client.read_coils, slave_id)
+                rr = await client.read_coils(address=address, count=1, **unit_kwargs)
             else:
                 raise ValueError(f"Unsupported source_type: {source_type}")
             if rr.isError():
@@ -236,7 +240,8 @@ class DeviceManager:
 
         async def _write(client: AsyncModbusTcpClient) -> bool:
             slave_id = self.devices_cfg[device].unit_id
-            rq = await client.write_coil(address=address, value=value, unit=slave_id)
+            unit_kwargs = self._unit_kwargs(client.write_coil, slave_id)
+            rq = await client.write_coil(address=address, value=value, **unit_kwargs)
             if rq.isError():
                 raise ModbusException(str(rq))
             return True
@@ -245,6 +250,28 @@ class DeviceManager:
         if ok is False:
             logging.debug("write_coil error on %s@%s after retry", device, address)
         return bool(ok)
+
+    def _unit_kwargs(self, method: Callable, unit_id: int) -> Dict[str, int]:
+        """
+        Provide the correct keyword argument for unit/slave depending on the pymodbus version.
+        Caches the result per-method name to avoid repeated signature inspection.
+        """
+
+        name = getattr(method, "__name__", repr(method))
+        if name not in self._unit_kwarg_cache:
+            params = inspect.signature(method).parameters
+            if "unit" in params:
+                self._unit_kwarg_cache[name] = "unit"
+            elif "slave" in params:
+                self._unit_kwarg_cache[name] = "slave"
+            else:
+                logging.warning(
+                    "Modbus client method '%s' lacks 'unit'/'slave' parameter; using library default",
+                    name,
+                )
+                self._unit_kwarg_cache[name] = None
+        kwarg = self._unit_kwarg_cache[name]
+        return {kwarg: unit_id} if kwarg else {}
 
 
 class LogicResultServer:
