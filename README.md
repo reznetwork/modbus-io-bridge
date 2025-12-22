@@ -5,6 +5,8 @@ basic boolean logic between multiple inputs. The bridge can also expose the
 evaluated logic results as discrete inputs on a built-in Modbus TCP or RTU
 server so other devices can consume them.
 
+Tested with `pymodbus==3.6.9`. Use that exact version for best compatibility.
+
 ## Startup validation and indicators
 
 On startup the bridge validates your configuration, checks connectivity to every
