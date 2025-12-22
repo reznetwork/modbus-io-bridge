@@ -5,15 +5,6 @@ basic boolean logic between multiple inputs. The bridge can also expose the
 evaluated logic results as discrete inputs on a built-in Modbus TCP or RTU
 server so other devices can consume them.
 
-## Startup validation and indicators
-
-On startup the bridge validates your configuration, checks connectivity to every
-configured device, and logs the results. You can optionally blink all configured
-outputs as a visual confirmation that initialization succeeded by enabling
-`startup_blink` in the `settings` section of your configuration. Control the
-blink timing with `startup_blink_on_ms`, `startup_blink_off_ms`, and
-`startup_blink_cycles`.
-
 ## Logical expressions
 
 Mappings can combine several inputs into a single output using a boolean
