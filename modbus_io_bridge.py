@@ -25,7 +25,7 @@ import logging
 import signal
 import ast
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set
 
 import yaml
 from pymodbus.client import AsyncModbusTcpClient
@@ -137,6 +137,41 @@ class DeviceManager:
             await client.connect()
         return client
 
+    async def _ensure_client(self, name: str) -> AsyncModbusTcpClient:
+        client = await self._get_client(name)
+        if not client.connected:
+            connected = await client.connect()
+            if not connected or not client.connected:
+                raise ConnectionError(f"Unable to connect to device '{name}'")
+        return client
+
+    async def _reset_client(self, name: str):
+        client = self.clients.pop(name, None)
+        if client:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    async def _with_reconnect_retry(
+        self,
+        name: str,
+        func: Callable[[AsyncModbusTcpClient], Awaitable[Any]],
+        default: Any,
+    ):
+        try:
+            client = await self._ensure_client(name)
+            return await func(client)
+        except Exception as exc:
+            logging.debug("Operation failed for %s, reconnecting: %s", name, exc)
+            await self._reset_client(name)
+            try:
+                client = await self._ensure_client(name)
+                return await func(client)
+            except Exception as exc2:
+                logging.debug("Operation failed again for %s after reconnect: %s", name, exc2)
+                return default
+
     async def check_all_devices(self) -> Dict[str, bool]:
         """Attempt to connect to every configured device and log the result."""
 
@@ -164,11 +199,8 @@ class DeviceManager:
 
     async def _check_device(self, name: str, cfg: DeviceConfig) -> bool:
         try:
-            client = await self._get_client(name)
-            if client.connected:
-                return True
-            # Try explicit connect if the client reports disconnected
-            return await client.connect()
+            client = await self._ensure_client(name)
+            return bool(client.connected)
         except Exception as exc:
             logging.debug("Device check for %s failed: %s", name, exc)
             return False
@@ -177,8 +209,8 @@ class DeviceManager:
         """
         Returns True/False or None on error.
         """
-        try:
-            client = await self._get_client(device)
+
+        async def _read(client: AsyncModbusTcpClient) -> bool:
             slave_id = self.devices_cfg[device].unit_id
             if source_type == "discrete_input":
                 rr = await client.read_discrete_inputs(address=address, count=1, unit=slave_id)
@@ -189,24 +221,30 @@ class DeviceManager:
             if rr.isError():
                 raise ModbusException(str(rr))
             return bool(rr.bits[0])
-        except Exception as e:
-            logging.debug(f"read_bit error on {device}@{address} ({source_type}): {e}")
-            return None
+
+        result = await self._with_reconnect_retry(device, _read, default=None)
+        if result is None:
+            logging.debug(
+                "read_bit error on %s@%s (%s) after retry", device, address, source_type
+            )
+        return result
 
     async def write_coil(self, device: str, address: int, value: bool) -> bool:
         """
         Returns True on success, False on failure.
         """
-        try:
-            client = await self._get_client(device)
+
+        async def _write(client: AsyncModbusTcpClient) -> bool:
             slave_id = self.devices_cfg[device].unit_id
             rq = await client.write_coil(address=address, value=value, unit=slave_id)
             if rq.isError():
                 raise ModbusException(str(rq))
             return True
-        except Exception as e:
-            logging.debug(f"write_coil error on {device}@{address}: {e}")
-            return False
+
+        ok = await self._with_reconnect_retry(device, _write, default=False)
+        if ok is False:
+            logging.debug("write_coil error on %s@%s after retry", device, address)
+        return bool(ok)
 
 
 class LogicResultServer:
