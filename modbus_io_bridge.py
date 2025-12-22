@@ -25,7 +25,7 @@ import logging
 import signal
 import ast
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 import yaml
 from pymodbus.client import AsyncModbusTcpClient
@@ -78,6 +78,10 @@ class Settings:
     poll_interval_ms: int = 100    # how often to poll each input
     log_level: str = "INFO"        # DEBUG/INFO/WARNING/ERROR
     connect_retry_s: float = 3.0   # reconnect backoff
+    startup_blink: bool = False    # blink outputs after successful startup
+    startup_blink_on_ms: int = 200
+    startup_blink_off_ms: int = 200
+    startup_blink_cycles: int = 2
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,42 @@ class DeviceManager:
         if not client.connected:  # ensure connection
             await client.connect()
         return client
+
+    async def check_all_devices(self) -> Dict[str, bool]:
+        """Attempt to connect to every configured device and log the result."""
+
+        results: Dict[str, bool] = {}
+        for name, cfg in self.devices_cfg.items():
+            ok = await self._check_device(name, cfg)
+            results[name] = ok
+            if ok:
+                logging.info(
+                    "Device '%s' available at %s:%s (unit %s)",
+                    name,
+                    cfg.host,
+                    cfg.port,
+                    cfg.unit_id,
+                )
+            else:
+                logging.error(
+                    "Device '%s' unreachable at %s:%s (unit %s)",
+                    name,
+                    cfg.host,
+                    cfg.port,
+                    cfg.unit_id,
+                )
+        return results
+
+    async def _check_device(self, name: str, cfg: DeviceConfig) -> bool:
+        try:
+            client = await self._get_client(name)
+            if client.connected:
+                return True
+            # Try explicit connect if the client reports disconnected
+            return await client.connect()
+        except Exception as exc:
+            logging.debug("Device check for %s failed: %s", name, exc)
+            return False
 
     async def read_bit(self, device: str, address: int, source_type: str) -> Optional[bool]:
         """
@@ -414,6 +454,11 @@ def load_config(path: str):
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
+    _validate_root_structure(raw)
+
+    raw_devices = raw.get("devices", []) or []
+    _validate_devices_raw(raw_devices)
+
     devices = {
         d["name"]: DeviceConfig(
             name=d["name"],
@@ -422,13 +467,17 @@ def load_config(path: str):
             unit_id=d.get("unit_id", 1),
             timeout=float(d.get("timeout", 3.0)),
         )
-        for d in raw.get("devices", [])
+        for d in raw_devices
     }
 
     settings = Settings(
         poll_interval_ms=int(raw.get("settings", {}).get("poll_interval_ms", 100)),
         log_level=str(raw.get("settings", {}).get("log_level", "INFO")).upper(),
         connect_retry_s=float(raw.get("settings", {}).get("connect_retry_s", 3.0)),
+        startup_blink=bool(raw.get("settings", {}).get("startup_blink", False)),
+        startup_blink_on_ms=int(raw.get("settings", {}).get("startup_blink_on_ms", 200)),
+        startup_blink_off_ms=int(raw.get("settings", {}).get("startup_blink_off_ms", 200)),
+        startup_blink_cycles=int(raw.get("settings", {}).get("startup_blink_cycles", 2)),
     )
 
     server_raw = raw.get("server", {}) or {}
@@ -458,8 +507,11 @@ def load_config(path: str):
         published=published,
     )
 
+    raw_mappings = raw.get("mappings", []) or []
+    _validate_mapping_names(raw_mappings)
+
     mappings = {}
-    for m in raw.get("mappings", []):
+    for m in raw_mappings:
         name = _derive_mapping_name(m)
         inputs: List[InputEndpoint] = []
         logic_expr = m.get("logic")
@@ -518,7 +570,100 @@ def load_config(path: str):
                 f"Server publish_mappings references unknown mapping '{pub.name}'"
             )
 
+    _validate_devices(devices)
+    _validate_mappings(mappings)
+
     return devices, settings, mappings, server_cfg
+
+
+def _validate_root_structure(raw: dict):
+    if raw is None:
+        raise ValueError("Configuration file is empty")
+    if not isinstance(raw, dict):
+        raise ValueError("Configuration file must contain a mapping at the root")
+
+
+def _validate_devices(devices: Dict[str, DeviceConfig]):
+    if not devices:
+        raise ValueError("Configuration must define at least one device")
+
+
+def _validate_devices_raw(raw_devices: List[dict]):
+    if not raw_devices:
+        raise ValueError("Configuration must define at least one device")
+    names_seen: Set[str] = set()
+    for dev in raw_devices:
+        name = dev.get("name")
+        if not name:
+            raise ValueError("Every device entry must include a 'name'")
+        if name in names_seen:
+            raise ValueError(f"Duplicate device name '{name}' in configuration")
+        names_seen.add(name)
+
+
+def _validate_mappings(mappings: Dict[str, Mapping]):
+    if not mappings:
+        raise ValueError("Configuration must define at least one mapping")
+    outputs_seen: Set[tuple] = set()
+    for mp in mappings.values():
+        out_key = (mp.output.device, mp.output.address)
+        if out_key in outputs_seen:
+            raise ValueError(
+                f"Multiple mappings attempt to drive the same output {mp.output.device}:{mp.output.address}"
+            )
+        outputs_seen.add(out_key)
+
+
+def _validate_mapping_names(raw_mappings: List[dict]):
+    if not raw_mappings:
+        raise ValueError("Configuration must define at least one mapping")
+    names: Set[str] = set()
+    for raw in raw_mappings:
+        name = raw.get("name")
+        if not name:
+            # fall back to derived name for duplicates check
+            name = _derive_mapping_name(raw)
+        if name in names:
+            raise ValueError(f"Duplicate mapping name '{name}' in configuration")
+        names.add(name)
+
+
+async def _blink_outputs(mappings: Iterable[Mapping], dm: DeviceManager, settings: Settings):
+    outputs = _collect_unique_outputs(mappings)
+    if not outputs:
+        logging.info("No outputs configured to blink on startup.")
+        return
+    on_s = settings.startup_blink_on_ms / 1000.0
+    off_s = settings.startup_blink_off_ms / 1000.0
+    cycles = max(1, settings.startup_blink_cycles)
+    logging.info(
+        "Blinking %s outputs for startup confirmation (%s cycles on %sms/off %sms)",
+        len(outputs),
+        cycles,
+        settings.startup_blink_on_ms,
+        settings.startup_blink_off_ms,
+    )
+    for idx in range(cycles):
+        for out in outputs:
+            await dm.write_coil(out.device, out.address, True)
+        await asyncio.sleep(on_s)
+        for out in outputs:
+            await dm.write_coil(out.device, out.address, False)
+        if idx < cycles - 1:
+            await asyncio.sleep(off_s)
+    logging.info("Startup blink completed.")
+
+
+def _collect_unique_outputs(mappings: Iterable[Mapping]) -> List[OutputEndpoint]:
+    seen: Set[tuple] = set()
+    outputs: List[OutputEndpoint] = []
+    for mp in mappings:
+        key = (mp.output.device, mp.output.address)
+        if key in seen:
+            continue
+        seen.add(key)
+        outputs.append(mp.output)
+    return outputs
 
 # ---------------------------
 # Main
@@ -532,9 +677,30 @@ async def main_async(cfg_path: str):
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    logging.info(
+        "Configuration validated: %s devices, %s mappings, server enabled=%s",
+        len(devices),
+        len(mappings),
+        server_cfg.enabled,
+    )
+
     dm = DeviceManager(devices)
     logic_server = LogicResultServer(server_cfg)
     await logic_server.start()
+
+    device_status = await dm.check_all_devices()
+    if device_status:
+        unavailable = [name for name, ok in device_status.items() if not ok]
+        if unavailable:
+            logging.warning("Some devices are unreachable at startup: %s", ", ".join(unavailable))
+        else:
+            logging.info("All configured devices are reachable.")
+
+    if settings.startup_blink:
+        if device_status and all(device_status.values()):
+            await _blink_outputs(mappings.values(), dm, settings)
+        else:
+            logging.info("Skipping startup blink because not all devices are reachable.")
 
     workers = [
         MappingWorker(name, dm, mp, settings, server=logic_server)
@@ -576,6 +742,10 @@ def main():
         asyncio.run(main_async(args.config))
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        logging.error("Fatal error during startup: %s", exc)
+        raise
 
 if __name__ == "__main__":
     main()
