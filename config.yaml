@@ -36,6 +36,10 @@ settings:
   poll_interval_ms: 100   # how often to read inputs
   log_level: INFO         # DEBUG/INFO/WARNING/ERROR
   connect_retry_s: 3.0    # backoff for reconnect
+  startup_blink: false    # blink all outputs on startup if true
+  startup_blink_on_ms: 200
+  startup_blink_off_ms: 200
+  startup_blink_cycles: 2
 
 # Optional Modbus server to expose logic outputs as discrete inputs
 server:
