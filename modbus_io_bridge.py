@@ -8,8 +8,7 @@ Mirror digital inputs from one (or many) Modbus/TCP devices to coils on another 
 - Async, resilient reconnects, optional debounce, optional invert, and on-error behavior.
 - Optional Modbus TCP/RTU server exposes logic results as discrete inputs for other devices.
 
-Requires: pymodbus==3.6.9 (asyncio client)
-    pip install "pymodbus==3.6.9"
+Requires: pymodbus==3.12.1 (asyncio client)
 
 Usage:
     python modbus_io_bridge.py --config config.yaml
@@ -30,14 +29,24 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set
 
 import yaml
 from pymodbus.client import AsyncModbusTcpClient
-from pymodbus.datastore import (
-    ModbusSequentialDataBlock,
-    ModbusServerContext,
-    ModbusSlaveContext,
-)
 from pymodbus.exceptions import ModbusException
-from pymodbus.server import StartAsyncSerialServer, StartAsyncTcpServer
-from pymodbus.transaction import ModbusRtuFramer
+
+# pymodbus has moved/renamed a few server/datastore symbols across 3.x releases.
+from pymodbus.datastore import ModbusSequentialDataBlock, ModbusServerContext
+try:
+    from pymodbus.datastore import ModbusDeviceContext as ModbusIoContext  # pymodbus>=3.2
+except ImportError:  # pragma: no cover
+    from pymodbus.datastore import ModbusSlaveContext as ModbusIoContext  # older 3.x
+
+try:
+    from pymodbus.server import StartAsyncSerialServer, StartAsyncTcpServer
+except ImportError:  # pragma: no cover
+    from pymodbus.server.async_io import StartAsyncSerialServer, StartAsyncTcpServer
+
+try:
+    from pymodbus.framer.rtu import ModbusRtuFramer
+except ImportError:  # pragma: no cover
+    from pymodbus.transaction import ModbusRtuFramer
 
 # ---------------------------
 # Data Models
@@ -297,7 +306,7 @@ class LogicResultServer:
         di_size = (max_addr - self.cfg.start_address) + 1
         self._di_block = ModbusSequentialDataBlock(self.cfg.start_address, [0] * di_size)
         empty_block = ModbusSequentialDataBlock(0, [0])
-        slave = ModbusSlaveContext(
+        slave = ModbusIoContext(
             di=self._di_block,
             co=empty_block,
             hr=empty_block,

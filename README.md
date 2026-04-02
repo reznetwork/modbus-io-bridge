@@ -5,7 +5,17 @@ basic boolean logic between multiple inputs. The bridge can also expose the
 evaluated logic results as discrete inputs on a built-in Modbus TCP or RTU
 server so other devices can consume them.
 
-Tested with `pymodbus==3.6.9`. Use that exact version for best compatibility.
+Tested with `pymodbus==3.12.1`.
+
+## Installation
+
+Create and activate a virtual environment, then install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
 ## Startup validation and indicators
 
