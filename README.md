@@ -33,6 +33,36 @@ Mappings can combine several inputs into a single output using a boolean
 XOR (`^`), as well as parentheses for grouping. Operator precedence follows
 Python boolean rules (`not` → `and` → `or`/`^`).
 
+## Fuzzy (rolling-window) logic
+
+Optionally, a mapping can derive its output state from recent history using a
+rolling time window.
+
+- **rolling_window**: turn output ON when at least `min_on` ON-events occurred in
+  the last `window_s` seconds.
+- **modes**:
+  - `rising_edge`: counts only False→True transitions (best match for “was on N times”)
+  - `sample_true`: counts every poll sample that is True
+
+Example: “if input was ON at least 5 times over the last minute, output is ON”:
+
+```yaml
+mappings:
+  - name: horn_burst_filter
+    input:
+      device: mb_io_2
+      address: 9
+      source_type: discrete_input
+    fuzzy:
+      type: rolling_window
+      window_s: 60
+      min_on: 5
+      mode: rising_edge
+    output:
+      device: mb_io_1
+      address: 2
+```
+
 ### Referencing inputs inside expressions
 
 Each input may define an optional `name` that is used inside the expression. If

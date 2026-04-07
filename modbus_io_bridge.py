@@ -24,8 +24,9 @@ import inspect
 import logging
 import signal
 import ast
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Optional, Set
 
 import yaml
 from pymodbus.client import AsyncModbusTcpClient
@@ -73,12 +74,32 @@ class OutputEndpoint:
     address: int           # coil address to write
 
 @dataclass(frozen=True)
+class FuzzyConfig:
+    """
+    Optional "fuzzy" evaluation to derive output state from recent history.
+
+    type: rolling_window
+      Keep a rolling time window of "ON events" and force output ON when at least
+      `min_on` events occurred within the last `window_s` seconds.
+
+      mode:
+        - rising_edge: count only False->True transitions of the evaluated result
+        - sample_true: count every poll sample that evaluates to True
+    """
+
+    type: str = "rolling_window"
+    window_s: float = 60.0
+    min_on: int = 5
+    mode: str = "rising_edge"
+
+@dataclass(frozen=True)
 class Mapping:
     name: str
     output: OutputEndpoint
     input: Optional[InputEndpoint] = None
     inputs: List[InputEndpoint] = field(default_factory=list)
     logic: Optional[str] = None           # boolean expression using input names
+    fuzzy: Optional[FuzzyConfig] = None
     invert: bool = False
     debounce_ms: int = 0           # require stable state for this many ms before writing
     on_error: str = "hold"         # "hold" (do nothing) or "force_off" or "force_on"
@@ -114,6 +135,15 @@ class ServerConfig:
     stopbits: int = 1
     start_address: int = 0
     published: List[PublishedMapping] = field(default_factory=list)
+
+@dataclass(frozen=True)
+class VehicleConfig:
+    name: str
+    short_name: Optional[str]
+    devices: Dict[str, DeviceConfig]
+    settings: Settings
+    mappings: Dict[str, Mapping]
+    server: ServerConfig
 
 # ---------------------------
 # Device Manager
@@ -382,6 +412,8 @@ class MappingWorker:
         self._candidate_since: Optional[float] = None
         self._inputs = self.mp.inputs if self.mp.inputs else ([self.mp.input] if self.mp.input else [])
         self.server = server
+        self._fuzzy_on_events: Deque[float] = deque()
+        self._fuzzy_prev_input: Optional[bool] = None
 
     def start(self):
         self._task = asyncio.create_task(self._run(), name=f"map:{self.name}")
@@ -409,6 +441,7 @@ class MappingWorker:
                     # hold => do nothing
                 else:
                     desired = self._evaluate_logic(values)
+                    desired = self._apply_fuzzy(desired)
                     if self.mp.invert:
                         desired = not desired
                     if debounce_s <= 0:
@@ -471,6 +504,46 @@ class MappingWorker:
             raise ValueError(f"Mapping '{self.name}' requires logic for multiple inputs")
         return next(iter(values.values()))
 
+    def _apply_fuzzy(self, base: bool) -> bool:
+        cfg = self.mp.fuzzy
+        if not cfg:
+            return bool(base)
+
+        if str(cfg.type).lower() != "rolling_window":
+            raise ValueError(f"Unsupported fuzzy type '{cfg.type}' in mapping '{self.name}'")
+
+        now = asyncio.get_event_loop().time()
+        window_s = float(cfg.window_s)
+        if window_s <= 0:
+            raise ValueError(f"fuzzy.window_s must be > 0 in mapping '{self.name}'")
+
+        min_on = int(cfg.min_on)
+        if min_on <= 0:
+            raise ValueError(f"fuzzy.min_on must be > 0 in mapping '{self.name}'")
+
+        mode = str(cfg.mode or "rising_edge").lower()
+        if mode not in ("rising_edge", "sample_true"):
+            raise ValueError(
+                f"Unsupported fuzzy.mode '{cfg.mode}' in mapping '{self.name}' "
+                "(use 'rising_edge' or 'sample_true')"
+            )
+
+        prev = bool(self._fuzzy_prev_input) if self._fuzzy_prev_input is not None else False
+        if mode == "rising_edge":
+            if base and not prev:
+                self._fuzzy_on_events.append(now)
+        else:  # sample_true
+            if base:
+                self._fuzzy_on_events.append(now)
+
+        self._fuzzy_prev_input = bool(base)
+
+        cutoff = now - window_s
+        while self._fuzzy_on_events and self._fuzzy_on_events[0] < cutoff:
+            self._fuzzy_on_events.popleft()
+
+        return len(self._fuzzy_on_events) >= min_on
+
 
 def _evaluate_expression(expr: str, values: Dict[str, bool]) -> bool:
     """
@@ -524,10 +597,7 @@ def _derive_mapping_name(raw_mapping: dict) -> str:
 # Config Loader
 # ---------------------------
 
-def load_config(path: str):
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-
+def _load_single_vehicle_from_raw(raw: dict) -> VehicleConfig:
     _validate_root_structure(raw)
 
     raw_devices = raw.get("devices", []) or []
@@ -589,6 +659,18 @@ def load_config(path: str):
         name = _derive_mapping_name(m)
         inputs: List[InputEndpoint] = []
         logic_expr = m.get("logic")
+        fuzzy_cfg: Optional[FuzzyConfig] = None
+        if m.get("fuzzy") is not None:
+            if not isinstance(m["fuzzy"], dict):
+                raise ValueError(f"Mapping '{name}' fuzzy must be a mapping/object")
+            fz = m["fuzzy"]
+            fz_type = str(fz.get("type", "rolling_window")).lower()
+            if fz_type != "rolling_window":
+                raise ValueError(f"Mapping '{name}' fuzzy.type must be 'rolling_window'")
+            window_s = float(fz.get("window_s", fz.get("window_seconds", 60.0)))
+            min_on = int(fz.get("min_on", fz.get("min_on_count", fz.get("min_true", 5))))
+            mode = str(fz.get("mode", "rising_edge")).lower()
+            fuzzy_cfg = FuzzyConfig(type=fz_type, window_s=window_s, min_on=min_on, mode=mode)
         if "inputs" in m:
             if not m["inputs"]:
                 raise ValueError(f"Mapping '{name}' must specify at least one input")
@@ -622,6 +704,7 @@ def load_config(path: str):
             input=inputs[0] if len(inputs) == 1 else None,
             inputs=inputs,
             logic=logic_expr,
+            fuzzy=fuzzy_cfg,
             output=OutputEndpoint(
                 device=out["device"],
                 address=int(out["address"]),
@@ -647,7 +730,131 @@ def load_config(path: str):
     _validate_devices(devices)
     _validate_mappings(mappings)
 
-    return devices, settings, mappings, server_cfg
+    vehicle_name = str(raw.get("name") or raw.get("vehicle") or "default")
+    short_name = raw.get("short_name")
+    if short_name is not None:
+        short_name = str(short_name)
+    return VehicleConfig(
+        name=vehicle_name,
+        short_name=short_name,
+        devices=devices,
+        settings=settings,
+        mappings=mappings,
+        server=server_cfg,
+    )
+
+
+def _merge_section_defaults(section_defaults: dict, section_raw: Optional[dict]) -> dict:
+    merged = dict(section_defaults or {})
+    merged.update(section_raw or {})
+    return merged
+
+
+def _apply_defaults_to_vehicle_raw(vehicle_raw: dict, defaults_raw: dict) -> dict:
+    v = dict(vehicle_raw or {})
+
+    # settings + server are shallow-merged
+    v["settings"] = _merge_section_defaults(defaults_raw.get("settings", {}) or {}, v.get("settings", {}) or {})
+    v["server"] = _merge_section_defaults(defaults_raw.get("server", {}) or {}, v.get("server", {}) or {})
+
+    # device defaults are applied per-device
+    dev_defaults = defaults_raw.get("device", {}) or {}
+    devices = v.get("devices", []) or []
+    if not isinstance(devices, list):
+        raise ValueError("vehicles[].devices must be a list")
+    merged_devices = []
+    for d in devices:
+        if not isinstance(d, dict):
+            raise ValueError("vehicles[].devices entries must be objects")
+        md = dict(dev_defaults)
+        md.update(d)
+        merged_devices.append(md)
+    v["devices"] = merged_devices
+    return v
+
+
+def load_config_multi(path: str) -> Dict[str, VehicleConfig]:
+    """
+    Load multi-vehicle configuration.
+
+    Returns a dict indexed by vehicle short_name when present, otherwise by name.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    _validate_root_structure(raw)
+    vehicles_raw = raw.get("vehicles", None)
+    if vehicles_raw is None:
+        raise ValueError("No 'vehicles' list found in config")
+    if not isinstance(vehicles_raw, list) or not vehicles_raw:
+        raise ValueError("'vehicles' must be a non-empty list")
+
+    defaults_raw = raw.get("defaults", {}) or {}
+    if defaults_raw is not None and not isinstance(defaults_raw, dict):
+        raise ValueError("'defaults' must be an object")
+
+    configs: List[VehicleConfig] = []
+    for vraw in vehicles_raw:
+        if not isinstance(vraw, dict):
+            raise ValueError("Each entry in 'vehicles' must be an object")
+        merged_raw = _apply_defaults_to_vehicle_raw(vraw, defaults_raw)
+        if "name" not in merged_raw:
+            raise ValueError("Each vehicle must include 'name'")
+        configs.append(_load_single_vehicle_from_raw(merged_raw))
+
+    # Validate identifiers (uniqueness)
+    short_names = [c.short_name for c in configs if c.short_name]
+    if len(short_names) != len(set(short_names)):
+        raise ValueError("Duplicate vehicle short_name detected in config")
+    names = [c.name for c in configs]
+    if len(names) != len(set(names)):
+        raise ValueError("Duplicate vehicle name detected in config")
+
+    # Validate server port uniqueness for enabled servers
+    used_ports: Dict[int, str] = {}
+    for c in configs:
+        if not c.server.enabled:
+            continue
+        port = int(c.server.port)
+        if port in used_ports:
+            raise ValueError(
+                f"Server port conflict: vehicles '{used_ports[port]}' and '{c.short_name or c.name}' both use port {port}"
+            )
+        used_ports[port] = c.short_name or c.name
+
+    indexed: Dict[str, VehicleConfig] = {}
+    for c in configs:
+        key = c.short_name or c.name
+        indexed[key] = c
+    return indexed
+
+
+def resolve_vehicle_id(vehicles_index: Dict[str, VehicleConfig], vehicle_id: str) -> VehicleConfig:
+    """
+    Resolve by short_name first (index key), then by exact match on .name.
+    """
+    if vehicle_id in vehicles_index:
+        return vehicles_index[vehicle_id]
+    matches = [v for v in vehicles_index.values() if v.name == vehicle_id]
+    if len(matches) == 1:
+        return matches[0]
+    available = sorted(
+        [k for k, v in vehicles_index.items() if v.short_name] or list(vehicles_index.keys())
+    )
+    raise ValueError(
+        f"Unknown or ambiguous vehicle '{vehicle_id}'. Known vehicle IDs: {', '.join(available)}"
+    )
+
+
+def load_config(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    # Back-compat: if 'vehicles' is present, this is a multi-vehicle config
+    if isinstance(raw, dict) and "vehicles" in raw:
+        return raw
+    vc = _load_single_vehicle_from_raw(raw)
+    return vc.devices, vc.settings, vc.mappings, vc.server
 
 
 def _validate_root_structure(raw: dict):
@@ -765,8 +972,18 @@ async def _write_outputs(outputs: List[OutputEndpoint], dm: DeviceManager, value
 # Main
 # ---------------------------
 
-async def main_async(cfg_path: str):
-    devices, settings, mappings, server_cfg = load_config(cfg_path)
+async def main_async(cfg_path: str, vehicle: Optional[str] = None):
+    loaded = load_config(cfg_path)
+    if isinstance(loaded, dict):
+        # multi-vehicle config
+        if not vehicle:
+            raise ValueError("Config contains 'vehicles'; you must specify --vehicle")
+        vehicles_index = load_config_multi(cfg_path)
+        vc = resolve_vehicle_id(vehicles_index, vehicle)
+        devices, settings, mappings, server_cfg = vc.devices, vc.settings, vc.mappings, vc.server
+        logging.info("Selected vehicle: %s (%s)", vc.name, vc.short_name or "<no short_name>")
+    else:
+        devices, settings, mappings, server_cfg = loaded
 
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
@@ -830,12 +1047,13 @@ async def main_async(cfg_path: str):
 def parse_args():
     p = argparse.ArgumentParser(description="Mirror Modbus digital inputs to coils across devices.")
     p.add_argument("--config", "-c", required=True, help="Path to YAML config")
+    p.add_argument("--vehicle", help="Vehicle id (short_name preferred; falls back to exact name)")
     return p.parse_args()
 
 def main():
     args = parse_args()
     try:
-        asyncio.run(main_async(args.config))
+        asyncio.run(main_async(args.config, vehicle=args.vehicle))
     except KeyboardInterrupt:
         pass
     except Exception as exc:

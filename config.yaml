@@ -142,3 +142,25 @@ mappings:
       address: 11
     debounce_ms: 150
     on_error: force_off
+
+  # Example "fuzzy" rolling-window logic:
+  # If the evaluated input is ON at least 5 times in the last 60 seconds,
+  # then the output is ON.
+  #
+  # mode: rising_edge  -> counts False->True transitions (events)
+  # mode: sample_true  -> counts every poll sample that is True
+  - name: horn_burst_filter
+    input:
+      device: mb_io_2
+      address: 9
+      source_type: discrete_input
+    fuzzy:
+      type: rolling_window
+      window_s: 60
+      min_on: 5
+      mode: rising_edge
+    output:
+      device: mb_io_1
+      address: 2
+    debounce_ms: 0
+    on_error: hold
