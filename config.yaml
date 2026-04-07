@@ -1,166 +1,152 @@
-# config_tractor.yaml configuration
-# Tractor MTZ 82 Modbus/TCP devices
-# MB_IO_1.10001 - Ручник
-# MB_IO_1.10002 - !Ремень
-# MB_IO_1.10003 - !Двигатель
+# Example multi-vehicle configuration.
+#
+# Run one vehicle:
+#   python3 modbus_io_bridge.py --config config.yaml --vehicle mtz_82
 
-# MB_IO_2.10000 - тормоз
-# МB_IO_2.10002 - левый поворотник
-# MB_IO_2.10003 - правый поворотник
-# MB_IO_2.10005 - ближний свет
-# MB_IO_2.10008 - ближний свет
-# MB_IO_2.10009 - Гудок
-
-
-devices:
-  - name: mb_io_1
-    host: 172.16.102.4
+defaults:
+  device:
     port: 502
     unit_id: 1
     timeout: 3.0
-
-  - name: mb_io_2
-    host: 172.16.102.5
-    port: 502
+  settings:
+    poll_interval_ms: 100
+    log_level: INFO
+    connect_retry_s: 3.0
+    startup_blink: false
+    startup_blink_on_ms: 200
+    startup_blink_off_ms: 200
+    startup_blink_cycles: 2
+  server:
+    enabled: true
+    protocol: tcp           # tcp | rtu
+    host: 0.0.0.0
+    port: 1502
     unit_id: 1
-    timeout: 3.0
+    start_address: 0
 
-  - name: mb_io_3
-    host: 172.16.102.8
-    port: 502
-    unit_id: 1
-    timeout: 3.0
+vehicles:
+  - name: "Tractor MTZ 82"
+    short_name: mtz_82
+    devices:
+      - name: mb_io_1
+        host: 172.16.102.4
+      - name: mb_io_2
+        host: 172.16.102.5
+      - name: mb_io_3
+        host: 172.16.102.8
 
-# Global settings
-settings:
-  poll_interval_ms: 100   # how often to read inputs
-  log_level: INFO         # DEBUG/INFO/WARNING/ERROR
-  connect_retry_s: 3.0    # backoff for reconnect
-  startup_blink: false    # blink all outputs on startup if true
-  startup_blink_on_ms: 200
-  startup_blink_off_ms: 200
-  startup_blink_cycles: 2
+    server:
+      publish_mappings:
+        - name: handbrake     # exposed at DI 0
+        - name: neutral       # exposed at DI 1
 
-# Optional Modbus server to expose logic outputs as discrete inputs
-server:
-  enabled: true
-  protocol: tcp           # tcp | rtu
-  host: 0.0.0.0
-  port: 1502
-  unit_id: 1
-  start_address: 0
-  publish_mappings:
-    - name: handbrake     # exposed at DI 0
-    - name: neutral       # exposed at DI 1
+      # RTU parameters (used when protocol is rtu)
+      serial_port: /dev/ttyUSB0
+      baudrate: 9600
+      bytesize: 8
+      parity: N
+      stopbits: 1
 
-  # RTU parameters (used when protocol is rtu)
-  serial_port: /dev/ttyUSB0
-  baudrate: 9600
-  bytesize: 8
-  parity: N
-  stopbits: 1
+    mappings:
+      - name: handbrake
+        input:
+          device: mb_io_1
+          address: 1               # read DI 1
+          source_type: discrete_input  # or "coil" to read coil
+        output:
+          device: mb_io_1
+          address: 0               # write to coil 0
+        invert: false
+        debounce_ms: 300
+        on_error: hold             # hold | force_off | force_on
 
-# Mappings: 1 output per entry, each with one or many inputs
-mappings:
-  - name: handbrake
-    input:
-      device: mb_io_1
-      address: 1               # read DI 1
-      source_type: discrete_input  # or "coil" to read coil
-    output:
-      device: mb_io_1
-      address: 0               # write to coil 0
-    invert: false
-    debounce_ms: 300
-    on_error: hold             # hold | force_off | force_on
+      - name: neutral
+        input:
+          device: mb_io_3
+          address: 0
+          source_type: discrete_input
+        output:
+          device: mb_io_1
+          address: 1
+        invert: false               # logical NOT of the input
+        debounce_ms: 300
+        on_error: force_off
 
-  - name: neutral
-    input:
-      device: mb_io_3
-      address: 0
-      source_type: discrete_input
-    output:
-      device: mb_io_1
-      address: 1
-    invert: false               # logical NOT of the input
-    debounce_ms: 300
-    on_error: force_off
+      # Example of combining multiple inputs with logic
+      - name: headlights_logic
+        inputs:
+          - name: switch_left
+            device: mb_io_2
+            address: 5
+            source_type: discrete_input
+          - name: switch_right
+            device: mb_io_2
+            address: 8
+            source_type: discrete_input
+        # Turn on output when exactly one of the switches is active
+        logic: "switch_left ^ switch_right"
+        output:
+          device: mb_io_2
+          address: 20
+        debounce_ms: 100
+        on_error: hold
 
-  # Example of combining multiple inputs with logic
-  - name: headlights_logic
-    inputs:
-      - name: switch_left
-        device: mb_io_2
-        address: 5
-        source_type: discrete_input
-      - name: switch_right
-        device: mb_io_2
-        address: 8
-        source_type: discrete_input
-    # Turn on output when exactly one of the switches is active
-    logic: "switch_left ^ switch_right"
-    output:
-      device: mb_io_2
-      address: 20
-    debounce_ms: 100
-    on_error: hold
+      # Example using implicit names (in1, in2, ...) when no input names are given
+      - name: fan_enable_logic
+        inputs:
+          - device: mb_io_2
+            address: 2
+            source_type: discrete_input
+          - device: mb_io_3
+            address: 7
+            source_type: discrete_input
+        logic: "in1 and not in2"  # in1 -> enable signal, in2 -> interlock
+        output:
+          device: mb_io_1
+          address: 12
+        debounce_ms: 200
+        on_error: hold
 
-  # Example using implicit names (in1, in2, ...) when no input names are given
-  - name: fan_enable_logic
-    inputs:
-      - device: mb_io_2
-        address: 2
-        source_type: discrete_input
-      - device: mb_io_3
-        address: 7
-        source_type: discrete_input
-    logic: "in1 and not in2"  # in1 -> enable signal, in2 -> interlock
-    output:
-      device: mb_io_1
-      address: 12
-    debounce_ms: 200
-    on_error: hold
+      # Example requiring two inputs ON and one input OFF
+      - name: dual_ok_one_blocked
+        inputs:
+          - name: ok_a
+            device: mb_io_1
+            address: 4
+            source_type: discrete_input
+          - name: ok_b
+            device: mb_io_1
+            address: 5
+            source_type: discrete_input
+          - name: blocked
+            device: mb_io_1
+            address: 6
+            source_type: discrete_input
+        logic: "ok_a and ok_b and not blocked"
+        output:
+          device: mb_io_2
+          address: 11
+        debounce_ms: 150
+        on_error: force_off
 
-  # Example requiring two inputs ON and one input OFF
-  - name: dual_ok_one_blocked
-    inputs:
-      - name: ok_a
-        device: mb_io_1
-        address: 4
-        source_type: discrete_input
-      - name: ok_b
-        device: mb_io_1
-        address: 5
-        source_type: discrete_input
-      - name: blocked
-        device: mb_io_1
-        address: 6
-        source_type: discrete_input
-    logic: "ok_a and ok_b and not blocked"
-    output:
-      device: mb_io_2
-      address: 11
-    debounce_ms: 150
-    on_error: force_off
-
-  # Example "fuzzy" rolling-window logic:
-  # If the evaluated input is ON at least 5 times in the last 60 seconds,
-  # then the output is ON.
-  #
-  # mode: rising_edge  -> counts False->True transitions (events)
-  # mode: sample_true  -> counts every poll sample that is True
-  - name: horn_burst_filter
-    input:
-      device: mb_io_2
-      address: 9
-      source_type: discrete_input
-    fuzzy:
-      type: rolling_window
-      window_s: 60
-      min_on: 5
-      mode: rising_edge
-    output:
-      device: mb_io_1
-      address: 2
-    debounce_ms: 0
-    on_error: hold
+      # Example "fuzzy" rolling-window logic:
+      # If the evaluated input is ON at least 5 times in the last 60 seconds,
+      # then the output is ON.
+      #
+      # mode: rising_edge  -> counts False->True transitions (events)
+      # mode: sample_true  -> counts every poll sample that is True
+      - name: horn_burst_filter
+        input:
+          device: mb_io_2
+          address: 9
+          source_type: discrete_input
+        fuzzy:
+          type: rolling_window
+          window_s: 60
+          min_on: 5
+          mode: rising_edge
+        output:
+          device: mb_io_1
+          address: 2
+        debounce_ms: 0
+        on_error: hold

@@ -17,6 +17,33 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Multi-vehicle configuration
+
+You can keep multiple vehicles in one config file under `vehicles:` and run a
+single one by selecting it via `--vehicle`.
+
+Vehicle identifiers:
+
+- Prefer using `vehicles[].short_name` (matches `monitor_config.json` `shortName`)
+- You can also use the exact `vehicles[].name`
+
+Example:
+
+```bash
+python3 modbus_io_bridge.py --config config.yaml --vehicle mtz_82
+```
+
+### Generating vehicles/devices from `monitor_config.json`
+
+To populate vehicle names, `short_name`, and controller IPs into a bridge config:
+
+```bash
+python3 tools/generate_bridge_config.py --monitor monitor_config.json --out config.generated.yaml --merge-in config.yaml
+```
+
+- `--merge-in` preserves any existing per-vehicle `mappings`, `settings`, and `server` blocks (keyed by `short_name`).
+- The generator does **not** auto-generate `mappings` from monitor `points` (different semantics).
+
 ## Startup validation and indicators
 
 On startup the bridge validates your configuration, checks connectivity to every

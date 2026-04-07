@@ -597,7 +597,7 @@ def _derive_mapping_name(raw_mapping: dict) -> str:
 # Config Loader
 # ---------------------------
 
-def _load_single_vehicle_from_raw(raw: dict) -> VehicleConfig:
+def _load_single_vehicle_from_raw(raw: dict, *, allow_empty_mappings: bool = False) -> VehicleConfig:
     _validate_root_structure(raw)
 
     raw_devices = raw.get("devices", []) or []
@@ -651,8 +651,14 @@ def _load_single_vehicle_from_raw(raw: dict) -> VehicleConfig:
         published=published,
     )
 
-    raw_mappings = raw.get("mappings", []) or []
-    _validate_mapping_names(raw_mappings)
+    raw_mappings = raw.get("mappings", None)
+    if raw_mappings is None:
+        raw_mappings = []
+    raw_mappings = raw_mappings or []
+    if not allow_empty_mappings:
+        _validate_mapping_names(raw_mappings)
+    elif raw_mappings:
+        _validate_mapping_names(raw_mappings)
 
     mappings = {}
     for m in raw_mappings:
@@ -728,7 +734,10 @@ def _load_single_vehicle_from_raw(raw: dict) -> VehicleConfig:
             )
 
     _validate_devices(devices)
-    _validate_mappings(mappings)
+    if not allow_empty_mappings:
+        _validate_mappings(mappings)
+    elif mappings:
+        _validate_mappings(mappings)
 
     vehicle_name = str(raw.get("name") or raw.get("vehicle") or "default")
     short_name = raw.get("short_name")
@@ -800,7 +809,9 @@ def load_config_multi(path: str) -> Dict[str, VehicleConfig]:
         merged_raw = _apply_defaults_to_vehicle_raw(vraw, defaults_raw)
         if "name" not in merged_raw:
             raise ValueError("Each vehicle must include 'name'")
-        configs.append(_load_single_vehicle_from_raw(merged_raw))
+        # Multi-configs may include vehicles that are not fully mapped yet.
+        # We'll validate structure/devices now, and validate mappings strictly only for the selected vehicle.
+        configs.append(_load_single_vehicle_from_raw(merged_raw, allow_empty_mappings=True))
 
     # Validate identifiers (uniqueness)
     short_names = [c.short_name for c in configs if c.short_name]
@@ -974,14 +985,20 @@ async def _write_outputs(outputs: List[OutputEndpoint], dm: DeviceManager, value
 
 async def main_async(cfg_path: str, vehicle: Optional[str] = None):
     loaded = load_config(cfg_path)
+    selected_vc: Optional[VehicleConfig] = None
     if isinstance(loaded, dict):
         # multi-vehicle config
         if not vehicle:
             raise ValueError("Config contains 'vehicles'; you must specify --vehicle")
         vehicles_index = load_config_multi(cfg_path)
         vc = resolve_vehicle_id(vehicles_index, vehicle)
+        if not vc.mappings:
+            raise ValueError(
+                f"Vehicle '{vc.short_name or vc.name}' has no mappings configured. "
+                "Add at least one mapping under vehicles[].mappings."
+            )
+        selected_vc = vc
         devices, settings, mappings, server_cfg = vc.devices, vc.settings, vc.mappings, vc.server
-        logging.info("Selected vehicle: %s (%s)", vc.name, vc.short_name or "<no short_name>")
     else:
         devices, settings, mappings, server_cfg = loaded
 
@@ -989,6 +1006,12 @@ async def main_async(cfg_path: str, vehicle: Optional[str] = None):
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    if selected_vc is not None:
+        logging.info(
+            "Selected vehicle: %s (%s)",
+            selected_vc.name,
+            selected_vc.short_name or "<no short_name>",
+        )
 
     logging.info(
         "Configuration validated: %s devices, %s mappings, server enabled=%s",
