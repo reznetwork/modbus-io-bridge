@@ -45,9 +45,13 @@ except ImportError:  # pragma: no cover
     from pymodbus.server.async_io import StartAsyncSerialServer, StartAsyncTcpServer
 
 try:
-    from pymodbus.framer.rtu import ModbusRtuFramer
+    # pymodbus>=3.8 uses FramerRTU
+    from pymodbus.framer.rtu import FramerRTU as ModbusRtuFramer
 except ImportError:  # pragma: no cover
-    from pymodbus.transaction import ModbusRtuFramer
+    try:
+        from pymodbus.framer import FramerRTU as ModbusRtuFramer
+    except ImportError:  # pragma: no cover
+        from pymodbus.transaction import ModbusRtuFramer
 
 # ---------------------------
 # Data Models
