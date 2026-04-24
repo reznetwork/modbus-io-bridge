@@ -351,13 +351,20 @@ class LogicResultServer:
             )
         self._di_block = ModbusSequentialDataBlock(internal_start, [0] * di_size)
         empty_block = ModbusSequentialDataBlock(1, [0])
-        slave = ModbusIoContext(
-            di=self._di_block,
-            co=empty_block,
-            hr=empty_block,
-            ir=empty_block,
-            zero_mode=True,
-        )
+        ctx_kwargs: Dict[str, Any] = {
+            "di": self._di_block,
+            "co": empty_block,
+            "hr": empty_block,
+            "ir": empty_block,
+        }
+        # pymodbus API compatibility: some versions do not support "zero_mode".
+        try:
+            ctx_params = inspect.signature(ModbusIoContext).parameters
+        except Exception:  # pragma: no cover
+            ctx_params = {}
+        if "zero_mode" in ctx_params:
+            ctx_kwargs["zero_mode"] = True
+        slave = ModbusIoContext(**ctx_kwargs)
         self._context = ModbusServerContext(slaves={self.cfg.unit_id: slave}, single=False)
 
         async def _run_server():
