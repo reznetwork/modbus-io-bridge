@@ -324,6 +324,7 @@ class LogicResultServer:
             pm.name: pm.address for pm in (cfg.published or [])
         }
         self._di_block: Optional[ModbusSequentialDataBlock] = None
+        self._di_addr_offset: int = 0
         self._task: Optional[asyncio.Task] = None
         self._context: Optional[ModbusServerContext] = None
 
@@ -338,8 +339,18 @@ class LogicResultServer:
             raise ValueError("Published mapping addresses cannot be below start_address")
         max_addr = max(self.mapping_addresses.values())
         di_size = (max_addr - self.cfg.start_address) + 1
-        self._di_block = ModbusSequentialDataBlock(self.cfg.start_address, [0] * di_size)
-        empty_block = ModbusSequentialDataBlock(0, [0])
+        # pymodbus 3.12 datastore simulator requires start address >= 1.
+        # We keep external "zero_mode" semantics by applying an internal offset.
+        internal_start = max(1, int(self.cfg.start_address))
+        self._di_addr_offset = internal_start - int(self.cfg.start_address)
+        if self._di_addr_offset:
+            logging.info(
+                "Server start_address=%s requires internal offset %+d (pymodbus start>=1); published addresses remain unchanged",
+                self.cfg.start_address,
+                self._di_addr_offset,
+            )
+        self._di_block = ModbusSequentialDataBlock(internal_start, [0] * di_size)
+        empty_block = ModbusSequentialDataBlock(1, [0])
         slave = ModbusIoContext(
             di=self._di_block,
             co=empty_block,
@@ -381,7 +392,7 @@ class LogicResultServer:
     def publish(self, mapping_name: str, value: bool):
         if not self._di_block or mapping_name not in self.mapping_addresses:
             return
-        address = self.mapping_addresses[mapping_name]
+        address = int(self.mapping_addresses[mapping_name]) + int(self._di_addr_offset)
         try:
             self._di_block.setValues(address, [int(bool(value))])
         except Exception as exc:
