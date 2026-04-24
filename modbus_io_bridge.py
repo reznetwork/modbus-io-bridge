@@ -365,7 +365,23 @@ class LogicResultServer:
         if "zero_mode" in ctx_params:
             ctx_kwargs["zero_mode"] = True
         slave = ModbusIoContext(**ctx_kwargs)
-        self._context = ModbusServerContext(slaves={self.cfg.unit_id: slave}, single=False)
+        # pymodbus API compatibility: context argument naming differs across releases.
+        unit_map = {self.cfg.unit_id: slave}
+        try:
+            server_ctx_params = inspect.signature(ModbusServerContext).parameters
+        except Exception:  # pragma: no cover
+            server_ctx_params = {}
+        try:
+            if "slaves" in server_ctx_params:
+                self._context = ModbusServerContext(slaves=unit_map, single=False)
+            elif "devices" in server_ctx_params:
+                self._context = ModbusServerContext(devices=unit_map, single=False)
+            else:
+                # Fallback to positional (older/newer variants).
+                self._context = ModbusServerContext(unit_map, single=False)
+        except TypeError:
+            # Last-resort positional fallback.
+            self._context = ModbusServerContext(unit_map, False)
 
         async def _run_server():
             if self.cfg.protocol.lower() == "tcp":
